@@ -18,7 +18,7 @@ The goal of this task is to detect digits in RGB images by predicting both their
 
 - How to train my model
 
-- python train.py
+- python train.py <--init_mode scratch(starting from DETR)/best(starting from best saved model)> <--epoch N>
 
 ### Inference
 
@@ -30,4 +30,4 @@ The goal of this task is to detect digits in RGB images by predicting both their
 
 ### Performance Snapshot
 
-![Competition Snapshot](images/results.png)
+![Competition Snapshot](images/image_1.png)
