@@ -2,7 +2,6 @@ import os
 import json
 
 import torch
-import matplotlib.pyplot as plt
 from PIL import Image
 from tqdm import tqdm
 
@@ -44,7 +43,8 @@ def main():
 
             outputs = model(pixel_values=pixel_values)
 
-            target_sizes = torch.tensor([[image.height, image.width]], device=DEVICE)
+            target_sizes = torch.tensor([[image.height, image.width]],
+                                        device=DEVICE)
 
             processed = processor.post_process_object_detection(
                 outputs,

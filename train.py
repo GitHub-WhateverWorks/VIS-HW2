@@ -79,7 +79,8 @@ def parse_args():
     parser.add_argument(
         "--reset_optimizer",
         action="store_true",
-        help="When using --init_mode best, load weights only and reset optimizer/scheduler state.",
+        help="When using --init_mode best, "
+        "load weights only and reset optimizer/scheduler state.",
     )
     parser.add_argument(
         "--epochs",
@@ -110,8 +111,11 @@ class DigitDataset(Dataset):
         with open(ann_path, "r") as f:
             data = json.load(f)
 
-        if not isinstance(data, dict) or "images" not in data or "annotations" not in data:
-            raise ValueError("Expected COCO-format JSON with 'images' and 'annotations'.")
+        if not isinstance(
+                data,
+                dict) or "images" not in data or "annotations" not in data:
+            raise ValueError(
+                "Expected COCO-format JSON with 'images' and 'annotations'.")
 
         self.images = data["images"]
         self.annotations = data["annotations"]
@@ -134,8 +138,6 @@ class DigitDataset(Dataset):
             cid = ann["category_id"]
             if cid < 1 or cid > NUM_CLASSES:
                 bad += 1
-        if bad > 0:
-            logger.warning(f"Found {bad} annotations with category_id outside 1..{NUM_CLASSES}")
 
     def __len__(self):
         return len(self.image_ids)
@@ -156,7 +158,7 @@ class DigitDataset(Dataset):
 
             coco_annotations.append({
                 "bbox": [x, y, w, h],
-                "category_id": ann["category_id"] - 1,  # 1..10 -> 0..9
+                "category_id": ann["category_id"] - 1,
                 "area": ann.get("area", w * h),
                 "iscrowd": ann.get("iscrowd", 0),
             })
@@ -174,7 +176,6 @@ class DigitDataset(Dataset):
         labels = encoding["labels"][0]
 
         return pixel_values, labels
-
 
 
 def collate_fn(batch):
@@ -229,9 +230,10 @@ def build_model(init_mode):
     if init_mode == "best":
         if not os.path.isdir(BEST_MODEL_DIR):
             raise FileNotFoundError(
-                f"--init_mode best was requested, but {BEST_MODEL_DIR} does not exist."
+                f"--init_mode best, yet {BEST_MODEL_DIR} does not exist."
             )
-        logger.info(f"Loading model from existing best checkpoint: {BEST_MODEL_DIR}")
+        logger.info(
+            f"Loading model from existing best checkpoint: {BEST_MODEL_DIR}")
         model = DetrForObjectDetection.from_pretrained(BEST_MODEL_DIR)
     else:
         logger.info(f"Loading fresh base DETR checkpoint: {BASE_MODEL_NAME}")
@@ -259,11 +261,13 @@ def save_training_state(epoch, best_score, optimizer, metric_name):
 
 def maybe_load_training_state(optimizer, reset_optimizer):
     if reset_optimizer:
-        logger.info("reset_optimizer=True, not restoring optimizer/training state.")
+        logger.info(
+            "reset_optimizer=True, not restoring optimizer/training state.")
         return 0, -1.0
 
     if not os.path.isfile(BEST_TRAIN_STATE):
-        logger.info("No saved training state found. Will continue with loaded weights only.")
+        logger.info(
+            "No saved training state found. Continue with loaded weights.")
         return 0, -1.0
 
     logger.info(f"Loading training state from {BEST_TRAIN_STATE}")
@@ -289,11 +293,14 @@ def evaluate(model, dataloader, processor, coco_gt):
 
         if USE_AMP_EVAL and DEVICE == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask)
+                outputs = model(
+                    pixel_values=pixel_values,
+                    pixel_mask=pixel_mask)
         else:
             outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask)
 
-        target_sizes = torch.stack([lab["orig_size"] for lab in labels]).to(DEVICE)
+        target_sizes = torch.stack([lab["orig_size"]
+                                   for lab in labels]).to(DEVICE)
 
         processed_results = processor.post_process_object_detection(
             outputs,
@@ -328,7 +335,8 @@ def evaluate(model, dataloader, processor, coco_gt):
 
     logger.info(f"Validation predictions count: {len(results)}")
     if len(dataloader.dataset) > 0:
-        logger.info(f"Average predictions per image: {len(results) / len(dataloader.dataset):.4f}")
+        logger.info(
+            f"Avg pred per img: {len(results) / len(dataloader.dataset):.4f}")
     logger.info(f"First 5 predictions: {results[:5]}")
 
     if len(results) == 0:
@@ -363,7 +371,9 @@ def main():
 
     train_processor = DetrImageProcessor.from_pretrained(
         BASE_MODEL_NAME,
-        size={"shortest_edge": TRAIN_SHORT_EDGE, "longest_edge": TRAIN_MAX_SIZE},
+        size={
+            "shortest_edge": TRAIN_SHORT_EDGE,
+            "longest_edge": TRAIN_MAX_SIZE},
     )
 
     val_processor = DetrImageProcessor.from_pretrained(
@@ -447,7 +457,8 @@ def main():
         for batch_idx, batch in enumerate(progress, start=1):
             pixel_values = batch["pixel_values"].to(DEVICE, non_blocking=True)
             pixel_mask = batch["pixel_mask"].to(DEVICE, non_blocking=True)
-            labels = [{k: v.to(DEVICE) for k, v in t.items()} for t in batch["labels"]]
+            labels = [{k: v.to(DEVICE) for k, v in t.items()}
+                      for t in batch["labels"]]
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -468,7 +479,9 @@ def main():
                 loss = outputs.loss
 
             if not torch.isfinite(loss):
-                logger.error(f"Non-finite loss at epoch {epoch}, batch {batch_idx}: {loss.item()}")
+                logger.error(
+                    f"Non-finite loss at epoch {epoch}, "
+                    f"batch {batch_idx}: {loss.item()}")
                 raise RuntimeError(f"Non-finite loss detected: {loss.item()}")
 
             loss.backward()
@@ -477,13 +490,18 @@ def main():
 
             total_loss += loss.item()
             avg_so_far = total_loss / batch_idx
-            progress.set_postfix(loss=f"{loss.item():.4f}", avg=f"{avg_so_far:.4f}")
+            progress.set_postfix(
+                loss=f"{loss.item():.4f}",
+                avg=f"{avg_so_far:.4f}")
 
             if batch_idx % LOG_LOSS_EVERY == 0:
                 loss_dict = outputs.loss_dict
-                loss_ce = loss_dict["loss_ce"].item() if "loss_ce" in loss_dict else -1.0
-                loss_bbox = loss_dict["loss_bbox"].item() if "loss_bbox" in loss_dict else -1.0
-                loss_giou = loss_dict["loss_giou"].item() if "loss_giou" in loss_dict else -1.0
+                loss_ce = loss_dict["loss_ce"].item(
+                ) if "loss_ce" in loss_dict else -1.0
+                loss_bbox = loss_dict["loss_bbox"].item(
+                ) if "loss_bbox" in loss_dict else -1.0
+                loss_giou = loss_dict["loss_giou"].item(
+                ) if "loss_giou" in loss_dict else -1.0
                 logger.info(
                     f"Epoch {epoch} Batch {batch_idx} | "
                     f"loss={loss.item():.4f} | "
@@ -496,20 +514,26 @@ def main():
         train_time = time.perf_counter() - epoch_start_time
 
         logger.info(f"Epoch {epoch}: avg train loss = {avg_loss:.4f}")
-        logger.info(f"Epoch {epoch}: train time = {train_time:.2f} sec ({train_time/60:.2f} min)")
+        logger.info(
+            f"Epoch {epoch}: "
+            f"train time = {train_time:.2f} sec ({train_time/60:.2f} min)")
 
         val_start_time = time.perf_counter()
         ap, ap50 = evaluate(model, val_loader, val_processor, coco_gt)
         val_time = time.perf_counter() - val_start_time
 
         logger.info(f"Epoch {epoch}: val AP = {ap:.4f}, val AP50 = {ap50:.4f}")
-        logger.info(f"Epoch {epoch}: val time = {val_time:.2f} sec ({val_time/60:.2f} min)")
+        logger.info(
+            f"Epoch {epoch}: "
+            f"val time = {val_time:.2f} sec ({val_time/60:.2f} min)")
 
         score_to_track = ap50 if SAVE_BY_AP50 else ap
 
         if score_to_track > best_score:
             best_score = score_to_track
-            logger.info(f"New best {metric_name}: {best_score:.4f}. Saving model to {BEST_MODEL_DIR}")
+            logger.info(
+                f"New best {metric_name}: "
+                f"{best_score:.4f}. Saving model to {BEST_MODEL_DIR}")
             model.save_pretrained(BEST_MODEL_DIR)
             val_processor.save_pretrained(BEST_MODEL_DIR)
             save_training_state(
@@ -520,7 +544,9 @@ def main():
             )
 
     total_time = time.perf_counter() - total_start_time
-    logger.info(f"Training finished. Total time = {total_time:.2f} sec ({total_time/60:.2f} min)")
+    logger.info(
+        f"Training finished. "
+        f"Total time = {total_time:.2f} sec ({total_time/60:.2f} min)")
     logger.info(f"Best {metric_name} = {best_score:.4f}")
 
 
