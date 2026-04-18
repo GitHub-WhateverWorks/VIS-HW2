@@ -3,6 +3,7 @@ import json
 import time
 import logging
 import random
+import argparse
 from collections import defaultdict
 
 import torch
@@ -32,25 +33,24 @@ BEST_MODEL_DIR = os.path.join(OUTPUT_DIR, "best_model")
 VAL_PRED_JSON = os.path.join(OUTPUT_DIR, "val_pred.json")
 LOG_FILE = os.path.join(OUTPUT_DIR, "train.log")
 
+BEST_TRAIN_STATE = os.path.join(OUTPUT_DIR, "best_train_state.pt")
+
+BASE_MODEL_NAME = "facebook/detr-resnet-50"
 NUM_CLASSES = 10
 
-TRAIN_BATCH_SIZE = 8
-VAL_BATCH_SIZE = 8
-EPOCHS = 30
-LR = 2e-5
+TRAIN_BATCH_SIZE = 6
+VAL_BATCH_SIZE = 6
+EPOCHS = 3
+LR = 5e-6
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 4
 
-# higher resolution from the start for better small-box localization
-TRAIN_SHORT_EDGE = 640
-TRAIN_MAX_SIZE = 960
-VAL_SHORT_EDGE = 640
-VAL_MAX_SIZE = 960
+TRAIN_SHORT_EDGE = 800
+TRAIN_MAX_SIZE = 1200
+VAL_SHORT_EDGE = 800
+VAL_MAX_SIZE = 1200
 
-# moderate threshold for mature models; feel free to sweep later
-SCORE_THRESHOLD = 0.06
-
-# IMPORTANT: save best by AP, not AP50
+SCORE_THRESHOLD = 0.1
 SAVE_BY_AP50 = False
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -64,9 +64,33 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(BEST_MODEL_DIR, exist_ok=True)
 
 
-# =========================
-# LOGGER
-# =========================
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--init_mode",
+        choices=["scratch", "best"],
+        default="scratch",
+        help=(
+            "scratch: start from base DETR checkpoint again; "
+            "best: continue from outputs/best_model"
+        ),
+    )
+    parser.add_argument(
+        "--reset_optimizer",
+        action="store_true",
+        help="When using --init_mode best, load weights only and reset optimizer/scheduler state.",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=EPOCHS,
+        help="Number of epochs to run in this launch.",
+    )
+
+    return parser.parse_args()
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -78,9 +102,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# =========================
-# DATASET
-# =========================
 class DigitDataset(Dataset):
     def __init__(self, img_dir, ann_path, processor):
         self.img_dir = img_dir
@@ -130,7 +151,6 @@ class DigitDataset(Dataset):
         coco_annotations = []
         for ann in anns:
             x, y, w, h = ann["bbox"]
-
             if w <= 0 or h <= 0:
                 continue
 
@@ -156,9 +176,7 @@ class DigitDataset(Dataset):
         return pixel_values, labels
 
 
-# =========================
-# COLLATE
-# =========================
+
 def collate_fn(batch):
     pixel_values = [item[0] for item in batch]
     labels = [item[1] for item in batch]
@@ -189,9 +207,76 @@ def collate_fn(batch):
     }
 
 
-# =========================
-# EVALUATION
-# =========================
+def build_label_maps():
+    id2label = {i: str(i) for i in range(NUM_CLASSES)}
+    label2id = {v: k for k, v in id2label.items()}
+    return id2label, label2id
+
+
+def apply_model_config_overrides(model):
+    # classification / background settings
+    model.config.eos_coefficient = 0.05
+    model.config.class_cost = 2
+
+    # localization-focused weighting
+    model.config.bbox_loss_coefficient = 10
+    model.config.giou_loss_coefficient = 4
+
+
+def build_model(init_mode):
+    id2label, label2id = build_label_maps()
+
+    if init_mode == "best":
+        if not os.path.isdir(BEST_MODEL_DIR):
+            raise FileNotFoundError(
+                f"--init_mode best was requested, but {BEST_MODEL_DIR} does not exist."
+            )
+        logger.info(f"Loading model from existing best checkpoint: {BEST_MODEL_DIR}")
+        model = DetrForObjectDetection.from_pretrained(BEST_MODEL_DIR)
+    else:
+        logger.info(f"Loading fresh base DETR checkpoint: {BASE_MODEL_NAME}")
+        model = DetrForObjectDetection.from_pretrained(
+            BASE_MODEL_NAME,
+            num_labels=NUM_CLASSES,
+            id2label=id2label,
+            label2id=label2id,
+            ignore_mismatched_sizes=True,
+        )
+
+    apply_model_config_overrides(model)
+    return model.to(DEVICE)
+
+
+def save_training_state(epoch, best_score, optimizer, metric_name):
+    state = {
+        "epoch": epoch,
+        "best_score": best_score,
+        "optimizer": optimizer.state_dict(),
+        "metric_name": metric_name,
+    }
+    torch.save(state, BEST_TRAIN_STATE)
+
+
+def maybe_load_training_state(optimizer, reset_optimizer):
+    if reset_optimizer:
+        logger.info("reset_optimizer=True, not restoring optimizer/training state.")
+        return 0, -1.0
+
+    if not os.path.isfile(BEST_TRAIN_STATE):
+        logger.info("No saved training state found. Will continue with loaded weights only.")
+        return 0, -1.0
+
+    logger.info(f"Loading training state from {BEST_TRAIN_STATE}")
+    state = torch.load(BEST_TRAIN_STATE, map_location="cpu")
+
+    if "optimizer" in state:
+        optimizer.load_state_dict(state["optimizer"])
+
+    last_epoch = int(state.get("epoch", 0))
+    best_score = float(state.get("best_score", -1.0))
+    return last_epoch, best_score
+
+
 @torch.no_grad()
 def evaluate(model, dataloader, processor, coco_gt):
     model.eval()
@@ -233,7 +318,7 @@ def evaluate(model, dataloader, processor, coco_gt):
 
                 results.append({
                     "image_id": image_id,
-                    "category_id": int(pred_label.item()) + 1,  # 0..9 -> 1..10
+                    "category_id": int(pred_label.item()) + 1,
                     "bbox": [x_min, y_min, w, h],
                     "score": float(score.item())
                 })
@@ -261,27 +346,28 @@ def evaluate(model, dataloader, processor, coco_gt):
     return ap, ap50
 
 
-# =========================
-# MAIN
-# =========================
 def main():
+    args = parse_args()
+
     logger.info(f"Using device: {DEVICE}")
     logger.info(f"USE_AMP_TRAIN = {USE_AMP_TRAIN}")
     logger.info(f"USE_AMP_EVAL  = {USE_AMP_EVAL}")
     logger.info(f"TRAIN_BATCH_SIZE = {TRAIN_BATCH_SIZE}")
     logger.info(f"VAL_BATCH_SIZE = {VAL_BATCH_SIZE}")
-    logger.info(f"EPOCHS = {EPOCHS}")
+    logger.info(f"EPOCHS this run = {args.epochs}")
     logger.info(f"LR = {LR}")
     logger.info(f"SCORE_THRESHOLD = {SCORE_THRESHOLD}")
     logger.info(f"SAVE_BY_AP50 = {SAVE_BY_AP50}")
+    logger.info(f"init_mode = {args.init_mode}")
+    logger.info(f"reset_optimizer = {args.reset_optimizer}")
 
     train_processor = DetrImageProcessor.from_pretrained(
-        "facebook/detr-resnet-50",
+        BASE_MODEL_NAME,
         size={"shortest_edge": TRAIN_SHORT_EDGE, "longest_edge": TRAIN_MAX_SIZE},
     )
 
     val_processor = DetrImageProcessor.from_pretrained(
-        "facebook/detr-resnet-50",
+        BASE_MODEL_NAME,
         size={"shortest_edge": VAL_SHORT_EDGE, "longest_edge": VAL_MAX_SIZE},
     )
 
@@ -311,25 +397,7 @@ def main():
         collate_fn=collate_fn,
     )
 
-    id2label = {i: str(i) for i in range(NUM_CLASSES)}
-    label2id = {v: k for k, v in id2label.items()}
-
-    model = DetrForObjectDetection.from_pretrained(
-        "facebook/detr-resnet-50",
-        num_labels=NUM_CLASSES,
-        id2label=id2label,
-        label2id=label2id,
-        ignore_mismatched_sizes=True,
-    ).to(DEVICE)
-
-    # classification / background settings
-    model.config.eos_coefficient = 0.05
-    model.config.class_cost = 2
-
-    # localization-focused weighting
-    # these are the important additions for tighter boxes
-    model.config.bbox_loss_coefficient = 8
-    model.config.giou_loss_coefficient = 3
+    model = build_model(args.init_mode)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -337,16 +405,34 @@ def main():
         weight_decay=WEIGHT_DECAY
     )
 
-    coco_gt = COCO(VAL_JSON)
+    start_epoch = 1
     best_score = -1.0
+
+    if args.init_mode == "best":
+        last_epoch, loaded_best_score = maybe_load_training_state(
+            optimizer=optimizer,
+            reset_optimizer=args.reset_optimizer
+        )
+        start_epoch = last_epoch + 1
+        best_score = loaded_best_score
+        logger.info(
+            f"Continuing from best model. Previous last_epoch={last_epoch}, "
+            f"previous best_score={best_score:.4f}"
+        )
+    else:
+        logger.info("Starting fresh from base DETR checkpoint.")
+
+    coco_gt = COCO(VAL_JSON)
+    metric_name = "AP50" if SAVE_BY_AP50 else "AP"
     total_start_time = time.perf_counter()
 
-    for epoch in range(1, EPOCHS + 1):
+    end_epoch = start_epoch + args.epochs - 1
+
+    for epoch in range(start_epoch, end_epoch + 1):
         epoch_start_time = time.perf_counter()
         model.train()
         total_loss = 0.0
 
-        # earlier LR decay for box refinement
         if epoch > 15:
             current_lr = 1e-5
         else:
@@ -357,7 +443,7 @@ def main():
 
         logger.info(f"Epoch {epoch}: lr = {current_lr}")
 
-        progress = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
+        progress = tqdm(train_loader, desc=f"Epoch {epoch}/{end_epoch}")
         for batch_idx, batch in enumerate(progress, start=1):
             pixel_values = batch["pixel_values"].to(DEVICE, non_blocking=True)
             pixel_mask = batch["pixel_mask"].to(DEVICE, non_blocking=True)
@@ -365,12 +451,21 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            outputs = model(
-                pixel_values=pixel_values,
-                pixel_mask=pixel_mask,
-                labels=labels
-            )
-            loss = outputs.loss
+            if USE_AMP_TRAIN and DEVICE == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    outputs = model(
+                        pixel_values=pixel_values,
+                        pixel_mask=pixel_mask,
+                        labels=labels
+                    )
+                    loss = outputs.loss
+            else:
+                outputs = model(
+                    pixel_values=pixel_values,
+                    pixel_mask=pixel_mask,
+                    labels=labels
+                )
+                loss = outputs.loss
 
             if not torch.isfinite(loss):
                 logger.error(f"Non-finite loss at epoch {epoch}, batch {batch_idx}: {loss.item()}")
@@ -411,17 +506,22 @@ def main():
         logger.info(f"Epoch {epoch}: val time = {val_time:.2f} sec ({val_time/60:.2f} min)")
 
         score_to_track = ap50 if SAVE_BY_AP50 else ap
-        metric_name = "AP50" if SAVE_BY_AP50 else "AP"
 
         if score_to_track > best_score:
             best_score = score_to_track
             logger.info(f"New best {metric_name}: {best_score:.4f}. Saving model to {BEST_MODEL_DIR}")
             model.save_pretrained(BEST_MODEL_DIR)
             val_processor.save_pretrained(BEST_MODEL_DIR)
+            save_training_state(
+                epoch=epoch,
+                best_score=best_score,
+                optimizer=optimizer,
+                metric_name=metric_name
+            )
 
     total_time = time.perf_counter() - total_start_time
     logger.info(f"Training finished. Total time = {total_time:.2f} sec ({total_time/60:.2f} min)")
-    logger.info(f"Best {'AP50' if SAVE_BY_AP50 else 'AP'} = {best_score:.4f}")
+    logger.info(f"Best {metric_name} = {best_score:.4f}")
 
 
 if __name__ == "__main__":

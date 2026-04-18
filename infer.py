@@ -8,17 +8,13 @@ from tqdm import tqdm
 
 from transformers import DetrForObjectDetection, DetrImageProcessor
 
-
-# =========================
-# CONFIG
-# =========================
 DATA_ROOT = "nycu-hw2-data"
 TEST_DIR = os.path.join(DATA_ROOT, "test")
 
 MODEL_DIR = os.path.join("outputs", "best_model")
 OUTPUT_JSON = "pred.json"
 
-SCORE_THRESHOLD = 0.06
+SCORE_THRESHOLD = 0.15
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
